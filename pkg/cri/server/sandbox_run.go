@@ -31,12 +31,15 @@ import (
 	containerdio "github.com/containerd/containerd/cio"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/log"
+	"github.com/containerd/containerd/oci"
+	imagestore "github.com/containerd/containerd/pkg/cri/store/image"
 	"github.com/containerd/containerd/snapshots"
 	cni "github.com/containerd/go-cni"
 	"github.com/containerd/nri"
 	v1 "github.com/containerd/nri/types/v1"
 	"github.com/containerd/typeurl"
 	"github.com/davecgh/go-spew/spew"
+	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sirupsen/logrus"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 
@@ -48,6 +51,7 @@ import (
 	"github.com/containerd/containerd/pkg/cri/util"
 	ctrdutil "github.com/containerd/containerd/pkg/cri/util"
 	"github.com/containerd/containerd/pkg/netns"
+	runtimespec "github.com/opencontainers/runtime-spec/specs-go"
 	selinux "github.com/opencontainers/selinux/go-selinux"
 )
 
@@ -104,22 +108,12 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 		},
 	)
 
-	// Ensure sandbox container image snapshot.
-	image, err := c.ensureImageExists(ctx, c.config.SandboxImage, config)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get sandbox image %q: %w", c.config.SandboxImage, err)
-	}
-	containerdImage, err := c.toContainerdImage(ctx, *image)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get image from containerd %q: %w", image.ID, err)
-	}
-
 	ociRuntime, err := c.getSandboxRuntime(config, r.GetRuntimeHandler())
 	if err != nil {
 		return nil, fmt.Errorf("failed to get sandbox runtime: %w", err)
 	}
-	sandbox.Metadata.CRIHandler = c.getCRIHandlerByRuntime(r.GetRuntimeHandler())
 
+	sandbox.Metadata.CRIHandler = c.getCRIHandlerByRuntime(r.GetRuntimeHandler())
 	log.G(ctx).WithField("podsandboxid", id).Debugf("use OCI runtime %+v", ociRuntime)
 
 	podNetwork := true
@@ -185,11 +179,39 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 	// NOTE: sandboxContainerSpec SHOULD NOT have side
 	// effect, e.g. accessing/creating files, so that we can test
 	// it safely.
-	spec, err := c.sandboxContainerSpec(id, config, &image.ImageSpec.Config, sandbox.NetNSPath, ociRuntime.PodAnnotations)
+
+	var spec *runtimespec.Spec
+	var specOpts []oci.SpecOpts
+	var image *imagestore.Image
+	var imageConfig *imagespec.ImageConfig
+	var containerdImage containerd.Image
+	var imageLabels map[string]string
+
+	if !isVMBasedRuntime(ociRuntime.Type) {
+		// Ensure sandbox container image snapshot.
+		//CC: VM container runtime (kata) doesn't need the image to preexist on the host
+		image, err = c.ensureImageExists(ctx, c.config.SandboxImage, config)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get sandbox image %q: %w", c.config.SandboxImage, err)
+		}
+		containerdImage, err = c.toContainerdImage(ctx, *image)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get image from containerd %q: %w", image.ID, err)
+		}
+		imageConfig = &image.ImageSpec.Config
+		imageLabels = image.ImageSpec.Config.Labels
+
+	}
+	spec, err = c.sandboxContainerSpec(id, config, imageConfig, sandbox.NetNSPath, ociRuntime.PodAnnotations)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate sandbox container spec: %w", err)
 	}
 	log.G(ctx).WithField("podsandboxid", id).Debugf("sandbox container spec: %#+v", spew.NewFormatter(spec))
+	// Generate spec options that will be applied to the spec later.
+	specOpts, err = c.sandboxContainerSpecOpts(config, imageConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate sanbdox container spec options: %w", err)
+	}
 	sandbox.ProcessLabel = spec.Process.SelinuxLabel
 	defer func() {
 		if retErr != nil {
@@ -208,27 +230,34 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 		spec.Process.SelinuxLabel = ""
 	}
 
-	// Generate spec options that will be applied to the spec later.
-	specOpts, err := c.sandboxContainerSpecOpts(config, &image.ImageSpec.Config)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate sanbdox container spec options: %w", err)
-	}
-
-	sandboxLabels := BuildLabels(config.Labels, image.ImageSpec.Config.Labels, containerKindSandbox)
+	sandboxLabels := BuildLabels(config.Labels, imageLabels, containerKindSandbox)
 
 	runtimeOpts, err := generateRuntimeOptions(ociRuntime, c.config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate runtime options: %w", err)
 	}
 	snapshotterOpt := snapshots.WithLabels(snapshots.FilterInheritedLabels(config.Annotations))
-	opts := []containerd.NewContainerOpts{
-		containerd.WithSnapshotter(c.config.ContainerdConfig.Snapshotter),
-		customopts.WithNewSnapshot(id, containerdImage, snapshotterOpt),
-		containerd.WithSpec(spec, specOpts...),
-		containerd.WithContainerLabels(sandboxLabels),
-		containerd.WithContainerExtension(sandboxMetadataExtension, &sandbox.Metadata),
-		containerd.WithRuntime(ociRuntime.Type, runtimeOpts)}
+	var opts []containerd.NewContainerOpts
 
+	if !isVMBasedRuntime(ociRuntime.Type) {
+		opts = []containerd.NewContainerOpts{
+			containerd.WithSnapshotter(c.config.ContainerdConfig.Snapshotter),
+			customopts.WithNewSnapshot(id, containerdImage, snapshotterOpt),
+			containerd.WithSpec(spec, specOpts...),
+			containerd.WithContainerLabels(sandboxLabels),
+			containerd.WithContainerExtension(sandboxMetadataExtension, &sandbox.Metadata),
+			containerd.WithRuntime(ociRuntime.Type, runtimeOpts)}
+	} else {
+		opts = []containerd.NewContainerOpts{
+			containerd.WithSnapshotter(c.config.ContainerdConfig.Snapshotter),
+			//CC: Creating container using the (pause) image name
+			containerd.WithImageName(c.config.SandboxImage),
+			containerd.WithSpec(spec, specOpts...),
+			containerd.WithContainerLabels(sandboxLabels),
+			containerd.WithContainerExtension(sandboxMetadataExtension, &sandbox.Metadata),
+			containerd.WithRuntime(ociRuntime.Type, runtimeOpts)}
+
+	}
 	container, err := c.client.NewContainer(ctx, id, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create containerd container: %w", err)

@@ -287,13 +287,15 @@ func filterLabel(k, v string) string {
 func BuildLabels(configLabels, imageConfigLabels map[string]string, containerType string) map[string]string {
 	labels := make(map[string]string)
 
-	for k, v := range imageConfigLabels {
-		if err := clabels.Validate(k, v); err == nil {
-			labels[k] = v
-		} else {
-			// In case the image label is invalid, we output a warning and skip adding it to the
-			// container.
-			logrus.WithError(err).Warnf("unable to add image label with key %s to the container", k)
+	if imageConfigLabels != nil {
+		for k, v := range imageConfigLabels {
+			if err := clabels.Validate(k, v); err == nil {
+				labels[k] = v
+			} else {
+				// In case the image label is invalid, we output a warning and skip adding it to the
+				// container.
+				logrus.WithError(err).Warnf("unable to add image label with key %s to the container", k)
+			}
 		}
 	}
 	// labels from the CRI request (config) will override labels in the image config
